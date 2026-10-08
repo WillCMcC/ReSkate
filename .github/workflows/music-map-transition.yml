@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S . -B build/music-fix -G "Visual Studio 17 2022" -A x64 -DDINGOSDK_BUILD_LAUNCHER_TESTS=ON -DDINGOSDK_VERSION=1.1.2-playlist-fix
+        run: cmake -S . -B build/music-fix -G "Visual Studio 17 2022" -A x64 -DDINGOSDK_BUILD_LAUNCHER_TESTS=ON "-DDINGOSDK_VERSION=1.1.2-playlist-fix"
       - name: Build runtime and music regressions
         run: cmake --build build/music-fix --config Release --parallel 4 --target dingosdk_runtime dingosdk_music_lifetime_tests dingosdk_music_safety_tests dingosdk_mod_music_tests
       - name: Run isolated tests (no game)
