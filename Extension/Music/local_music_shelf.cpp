@@ -7,6 +7,7 @@
 #include "Engine/Game/Build/20260929/local_music.h"
 #include "Extension/Profile/runtime_internal.h"
 #include "Extension/UI/NativeMenu/native_menu_data.h"
+#include "Extension/UI/NativeMenu/native_menu_lifetime.h"
 #include <algorithm>
 #include <cstring>
 #include <exception>
@@ -27,11 +28,41 @@ std::string music_diag_hex(std::uint64_t value, int width) {
 namespace md = dingosdk::multiplayer::menu_data;
 struct ModsShelf {
     std::uintptr_t manager{};
-    md::Value anchor{}, tiles{}, featured_anchor{};
+    md::Value anchor{}, tiles{}, featured_anchor{}, list{};
+    md::OwnedMenuModels<md::Value> owned;
     ULONGLONG next_poll{};
     std::vector<std::byte> published_rows;
 };
 ModsShelf mods_shelf;
+bool shelf_blocked{}, shelf_shutdown{};
+
+// The cloned templates contain asset pointers. Detach and destroy them while
+// their world is still loaded, as the other native ReSkate menus do.
+void music_release_shelf(const md::Context& context) {
+    if (mods_shelf.manager != context.manager) {
+        mods_shelf = {}; // The old manager owns its own teardown; never use it here.
+        return;
+    }
+    mods_shelf.owned.release([&] {
+        if (!mods_shelf.list.handle || context.type_of(mods_shelf.list.handle) != mods_shelf.list.type) return;
+        const auto items = context.field(mods_shelf.list, 0x67223da7U);
+        unsigned count{}, stride{};
+        const auto bytes = context.array(items, 64, count, stride);
+        md::require(stride == sizeof(md::Ref), "Music shelf cleanup schema differs.");
+        std::vector<std::byte> retained;
+        for (unsigned i = 0; i < count; ++i) {
+            const auto* first = bytes.data() + std::size_t{i} * stride;
+            md::Ref ref{};
+            std::memcpy(&ref, first, sizeof(ref));
+            if ((ref.handle & ~std::uint64_t{1}) == mods_shelf.anchor.handle) continue;
+            retained.insert(retained.end(), first, first + stride);
+        }
+        if (retained.size() != bytes.size())
+            context.array(items, retained, static_cast<unsigned>(retained.size() / stride));
+    }, [&](md::Value value) { context.destroy(value); });
+    mods_shelf = {};
+}
+
 // Read inline typed fields without creating child handles during authored construction.
 std::uintptr_t music_inline_path(const md::Context& context, std::uintptr_t data,
     std::uintptr_t type, std::initializer_list<std::uint32_t> hashes) {
@@ -138,7 +169,13 @@ std::string music_shelf_append_one(std::uintptr_t base, std::uintptr_t model, st
             std::memcpy(&record_ref, bytes.data() + stride, 8);
             std::memcpy(&source_vm, bytes.data() + stride + 8, 8);
             const auto source_type = shelf.type_of(source_vm & ~std::uint64_t{1});
+            // Release any prior screen instance before retaining another template.
+            music_release_shelf(shelf);
+            mods_shelf.manager = model;
+            mods_shelf.list = root.model;
             auto new_vm = shelf.create(md::Schema{0x0e3be640U, 192}, (GetTickCount64() << 12) | 0x4dU);
+            mods_shelf.anchor = new_vm;
+            mods_shelf.owned.track(new_vm);
             md::Value new_tiles{};
             try {
                 const md::Value source_anchor{source_vm, source_type};
@@ -153,14 +190,15 @@ std::string music_shelf_append_one(std::uintptr_t base, std::uintptr_t model, st
                     tile_data = md::read<std::uintptr_t>(tile_ref.record + 0x20);
                 md::require(tile_data != 0, "Music tile template is not available.");
                 new_tiles = shelf.create(md::Schema{0x74b1ea1dU, 392}, (GetTickCount64() << 12) | 0x4eU);
+                mods_shelf.tiles = new_tiles;
+                mods_shelf.owned.track(new_tiles);
                 shelf.copy(new_tiles, tile_data);
                 shelf.text(shelf.path(new_tiles, {0xfaec2d05U, 0xcb79482dU, 0x4d8e01b9U}), "Mods");
                 // An independent list retains each native row's actions and artwork on publication.
                 shelf.array(shelf.field(new_tiles, 0x67223da7U), std::span<const std::byte>{}, 0);
                 shelf.set(shelf.path(new_vm, {0x214d4984U, 0x25e4d6c8U}), md::Ref{0, new_tiles.handle});
             } catch (...) {
-                if (new_tiles.handle) shelf.destroy(new_tiles);
-                shelf.destroy(new_vm);
+                music_release_shelf(shelf);
                 throw;
             }
             std::vector<std::byte> element(stride);
@@ -169,12 +207,7 @@ std::string music_shelf_append_one(std::uintptr_t base, std::uintptr_t model, st
             auto merged = bytes;
             merged.insert(merged.begin(), element.begin(), element.end());
             shelf.array(items, merged, count + 1);
-            const auto previous = mods_shelf;
-            mods_shelf = {model, new_vm, new_tiles, md::Value{target, shelf.type_of(target)}, 0};
-            // Release our previous generation after the new shelf has been published.
-            if (previous.manager == model) {
-                try { shelf.destroy(previous.anchor); shelf.destroy(previous.tiles); } catch (const std::exception&) {}
-            }
+            mods_shelf.featured_anchor = md::Value{target, shelf.type_of(target)};
             try { music_sync_mods(shelf); } catch (const std::exception&) {}
             unsigned after = 0, after_stride = 0;
             shelf.array(items, 64, after, after_stride);
@@ -197,7 +230,8 @@ std::uint64_t music_model_construct_hook(std::uintptr_t manager, std::uint8_t mo
     const auto handle = music_model_construct_original(manager, mode, id, type, flag, record);
     PreserveError preserve;
     try {
-        if (!handle || !type || md::read<std::uint32_t>(md::read<std::uintptr_t>(type)) != 0x48455d84U)
+        if (!local_runtime().active.load(std::memory_order_acquire) || shelf_blocked ||
+            !handle || !type || md::read<std::uint32_t>(md::read<std::uintptr_t>(type)) != 0x48455d84U)
             return handle;
         bool is_music_shelf = false;
         {
@@ -229,7 +263,8 @@ std::uint64_t music_model_construct_hook(std::uintptr_t manager, std::uint8_t mo
         for (const auto& playlist : mod_music_playlists())
             if (!playlist.songs.empty()) { has_mod_playlists = true; break; }
         if (!has_mod_playlists) {
-            mods_shelf = {};
+            game::ModelWriteLock lock(manager);
+            music_release_shelf(md::Context{local_runtime().base, manager});
             dingosdk::logging::event(dingosdk::logging::Channel::music, "{\"event\":\"music_mods_shelf_skipped\"}");
             return handle;
         }
@@ -240,9 +275,36 @@ std::uint64_t music_model_construct_hook(std::uintptr_t manager, std::uint8_t mo
     return handle;
 }
 
+void music_shelf_before_level_transition(unsigned next) noexcept {
+    if (next == 3 || next == 14 || next == 22 || next == 24 || next == 25) {
+        // Block constructor/poll reentry before typed destruction can dispatch callbacks.
+        shelf_blocked = true;
+        shelf_shutdown |= next == 24 || next == 25;
+        if (mods_shelf.owned.empty()) return;
+        try {
+            const auto base = local_runtime().base;
+            // Use the global UI manager even if the music provider has already detached.
+            const auto ui = md::read<std::uintptr_t>(base + addr::engine::ui_manager);
+            const auto model = ui ? md::read<std::uintptr_t>(ui + 0x140) : 0;
+            md::require(model != 0, "Music model manager unavailable during cleanup.");
+            game::ModelWriteLock lock(model);
+            music_release_shelf(md::Context{base, model});
+            logging::log(logging::Level::info, logging::Channel::music,
+                "Mods music shelf models released before state {}.", next);
+        } catch (const std::exception& error) {
+            logging::log(logging::Level::warning, logging::Channel::music,
+                "Mods music shelf cleanup failed before state {}: {}", next, error.what());
+        } catch (...) {
+            logging::write(logging::Level::warning, logging::Channel::music, "Mods music shelf cleanup failed.");
+        }
+    } else if (!shelf_shutdown && (next == 4 || next == 8 || next == 13 || next == 16 || next == 21)) {
+        shelf_blocked = false; // New authored shelves are built during loading.
+    }
+}
+
 void update_music_shelf() {
     auto& runtime = local_runtime();
-    if (!runtime.active.load(std::memory_order_acquire)) return;
+    if (!runtime.active.load(std::memory_order_acquire) || shelf_blocked) return;
     PreserveError preserve;
     music_poll_mods(runtime.base);
 }

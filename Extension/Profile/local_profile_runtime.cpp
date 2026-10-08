@@ -340,6 +340,7 @@ void local_profile_before_level_transition(unsigned next) noexcept {
     auto& s = local_runtime();
     if (!s.active.load(std::memory_order_acquire)) return;
     std::lock_guard lock(s.native_mutex);
+    music_shelf_before_level_transition(next);
     news_runtime().pending.before_transition(next);
     object_runtime().pending.before_transition(next);
     auto& placements = placements_runtime();
