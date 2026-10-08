@@ -5,6 +5,30 @@
 #include <cstdio>
 #include <thread>
 
+// Native dependencies are replaced only at the game boundary; queueing, identity,
+// lease acquisition, retry and transition cancellation run production code.
+namespace dingosdk::profile_runtime {
+LocalRuntime& local_runtime() { static auto* value = new LocalRuntime; return *value; }
+CosmeticRuntime& cosmetic_runtime() { static CosmeticRuntime value; return value; }
+CosmeticCatalogFunctions& cosmetic_catalog_functions() { static CosmeticCatalogFunctions value; return value; }
+bool read_music_catalog(MusicCatalog&) { return false; } // Assets have not registered yet.
+bool install_playlist_lookup_safety(std::uintptr_t) noexcept { return false; }
+void cosmetic_release(CosmeticShared& value) noexcept {
+    if (value.control) {
+        auto* counts = reinterpret_cast<volatile LONG*>(static_cast<std::byte*>(value.control) + 8);
+        InterlockedDecrement(counts);
+        InterlockedDecrement(counts + 1);
+    }
+    value = {};
+}
+bool identifier(const void*, std::string&) { throw std::runtime_error("Unexpected publication"); }
+std::uint32_t cosmetic_hash(std::string_view) { throw std::runtime_error("Unexpected publication"); }
+bool cosmetic_text(std::uintptr_t, std::string&) { throw std::runtime_error("Unexpected publication"); }
+void cosmetic_varint(std::string&, std::uint64_t) { throw std::runtime_error("Unexpected publication"); }
+void cosmetic_wire_number(std::string&, unsigned, std::uint64_t) { throw std::runtime_error("Unexpected publication"); }
+void cosmetic_wire_string(std::string&, unsigned, std::string_view) { throw std::runtime_error("Unexpected publication"); }
+}
+
 using namespace dingosdk;
 using namespace dingosdk::profile_runtime;
 namespace {
