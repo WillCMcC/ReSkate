@@ -77,7 +77,8 @@ bool music_ui_identity(const MusicUiPending& pending) {
 }
 
 bool music_ui_current(const MusicUiPending& pending) {
-    return pending.generation == music_ui_runtime().generation && music_ui_identity(pending);
+    return !music_ui_runtime().blocked &&
+        pending.generation == music_ui_runtime().generation && music_ui_identity(pending);
 }
 
 CosmeticShared music_ui_lease(const MusicUiPending& pending) {
@@ -191,13 +192,14 @@ void music_ui_initialize_hook(std::uint64_t all, std::uint64_t hidden, std::uint
         // Even a forwarded initialization supersedes old local contexts.
         const auto generation = ++ui.generation;
         ui.pending.reset();
-        if (s.active.load(std::memory_order_acquire))
+        if (s.active.load(std::memory_order_acquire) && !ui.blocked)
         try {
-            const auto thread = GetCurrentThreadId();
             auto pending = std::make_unique<MusicUiPending>();
             pending->contexts = {all, hidden, featured, liked, discovered, favorites, songs};
             std::uintptr_t owner{}, vtable{}; std::int32_t strong{};
-            if ((!cosmetic_runtime().update_thread || cosmetic_runtime().update_thread == thread) && callback &&
+            // Script construction may run on a loading worker after map travel.
+            // Capture owned input here; only the verified client tick publishes it.
+            if (callback &&
                 std::all_of(pending->contexts.begin(), pending->contexts.end(), [](auto c) { return c != 0; }) &&
                 read(reinterpret_cast<std::uintptr_t>(handle), pending->favorites) && pending->favorites &&
                 read(s.base + addr::local_music::ui_manager, pending->manager) && pending->manager &&
@@ -209,23 +211,39 @@ void music_ui_initialize_hook(std::uint64_t all, std::uint64_t hidden, std::uint
                     game::native_data().values.copy_delegate(&pending->delegate, callback);
                     if (pending->delegate) {
                         if (generation != ui.generation) return;
-                        pending->thread = thread; pending->generation = generation;
+                        pending->generation = generation;
                         ui.pending = std::move(pending);
-                        dingosdk::logging::event(dingosdk::logging::Channel::music, "{\"event\":\"native_music_ui_queued\"}"); return;
+                        logging::log(logging::Level::info, logging::Channel::music,
+                            "Music catalog queued (generation {}, caller {}, client {}).",
+                            generation, GetCurrentThreadId(), cosmetic_runtime().update_thread); return;
                     }
                 }
             }
         } catch (...) { dingosdk::logging::event(dingosdk::logging::Channel::music, "{\"event\":\"native_music_ui_queue_failed\"}"); }
     }
+    logging::write(logging::Level::info, logging::Channel::music, "Music initialization forwarded to native provider.");
     ui.functions.initialize(all, hidden, featured, liked, discovered, favorites, songs, handle, callback);
+}
+
+void music_ui_before_level_transition(unsigned next) {
+    auto& ui = music_ui_runtime();
+    if (next == 3 || next == 14 || next == 22 || next == 24 || next == 25) {
+        ui.blocked = true;
+        ui.shutdown |= next == 24 || next == 25;
+        ++ui.generation; // Also invalidates a request moved into an active publication.
+        ui.pending.reset(); // The copied delegate still borrows its script descriptor.
+    } else if (!ui.shutdown && (next == 4 || next == 8 || next == 13 || next == 16 || next == 21)) {
+        ui.blocked = false;
+    }
 }
 
 void update_music_catalog() {
     auto& s = local_runtime(); auto& ui = music_ui_runtime();
-    if (!s.active.load(std::memory_order_acquire) || ui.updating || cosmetic_runtime().update_thread != GetCurrentThreadId()) return;
+    if (!s.active.load(std::memory_order_acquire) || cosmetic_runtime().update_thread != GetCurrentThreadId()) return;
     PreserveError preserve; std::lock_guard lock(s.native_mutex);
+    if (ui.updating || ui.blocked) return;
     if (!ui.pending) return;
-    if (ui.pending->thread != GetCurrentThreadId() || !music_ui_current(*ui.pending)) { ui.pending.reset(); return; }
+    if (!music_ui_current(*ui.pending)) { ui.pending.reset(); return; }
     const auto now = GetTickCount64(); if (now < ui.pending->next_poll) return;
     ui.pending->next_poll = now + 250;
     auto pending = std::move(ui.pending);
@@ -234,7 +252,7 @@ void update_music_catalog() {
     struct PendingScope {
         MusicUiRuntime& ui; std::unique_ptr<MusicUiPending>& pending; bool& retry;
         ~PendingScope() {
-            if (retry && !ui.pending && pending && pending->generation == ui.generation)
+            if (retry && !ui.blocked && !ui.pending && pending && pending->generation == ui.generation)
                 ui.pending = std::move(pending);
             ui.updating = false;
         }
@@ -296,6 +314,9 @@ void update_music_catalog() {
             if (!music_ui_has_context(manager + 0xd0, song.id)) throw std::runtime_error("Native song identity missing");
         if (!music_ui_current(*pending)) return;
         ui.functions.complete(&pending->delegate);
+        logging::log(logging::Level::info, logging::Channel::music,
+            "Music catalog ready: {} playlists, {} songs (generation {}).",
+            playlist_count, song_count, pending->generation);
         dingosdk::logging::event(dingosdk::logging::Channel::music, dingosdk::Json{{"event", "native_music_ui_complete"}, {"playlists", playlist_count}, {"songs", song_count}, {"source", "runtime_music_assets"}}.dump().c_str());
     } catch (...) { retry = false; dingosdk::logging::event(dingosdk::logging::Channel::music, "{\"event\":\"native_music_ui_publish_failed\"}"); }
 }

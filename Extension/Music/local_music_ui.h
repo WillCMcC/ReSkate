@@ -30,7 +30,6 @@ struct MusicUiPending {
     std::uintptr_t manager{}, model{}, owner{}, delegate{};
     std::array<std::uint64_t, 7> contexts{};
     std::uint32_t favorites{};
-    DWORD thread{};
     std::uint64_t generation{}, next_poll{};
     bool waiting_logged{};
     ~MusicUiPending() {
@@ -43,7 +42,7 @@ struct MusicUiRuntime {
     MusicUiFunctions functions;
     std::unique_ptr<MusicUiPending> pending;
     std::uint64_t generation{};
-    bool updating{};
+    bool updating{}, blocked{}, shutdown{};
 };
 
 MusicUiRuntime& music_ui_runtime();
@@ -80,6 +79,9 @@ bool music_ui_has_context(std::uintptr_t map, const std::string& id);
 void music_ui_initialize_hook(std::uint64_t all, std::uint64_t hidden, std::uint64_t featured,
     std::uint64_t liked, std::uint64_t discovered, std::uint64_t favorites, std::uint64_t songs,
     const std::uint32_t* handle, const void* callback);
+
+// Cancel asset-backed delegates before their world unloads. Called under native_mutex.
+void music_ui_before_level_transition(unsigned next);
 
 void update_music_catalog();
 
